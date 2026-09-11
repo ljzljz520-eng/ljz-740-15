@@ -1,0 +1,15 @@
+services:
+  stablediffusion:
+    build: .
+    image: stablediffusion-go:latest
+    container_name: stablediffusion-go
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models
+      - ./outputs:/app/outputs
+    environment:
+      - MODEL_PATH=/app/models/model.gguf
+      - HOST=0.0.0.0
+      - PORT=8080
+    restart: unless-stopped

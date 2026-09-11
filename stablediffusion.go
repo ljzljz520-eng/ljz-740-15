@@ -1,11 +1,32 @@
 package stablediffusion
 
 import (
+	"errors"
 	"fmt"
 	"unsafe"
 
 	"github.com/example/stablediffusion/bindings"
 )
+
+// ProgressInfo 表示一次进度回调的信息。
+type ProgressInfo struct {
+	// Step 当前步数，取值 0..Steps（0 表示阶段刚开始）
+	Step int
+	// Steps 当前阶段的总步数；阶段切换类事件可能为 0
+	Steps int
+	// Time 每步平均耗时（秒）
+	Time float32
+	// Phase 当前阶段文字，如 "loading model"、"encoding prompt"、
+	// "sampling"、"sampling (high noise)"、"decoding"
+	Phase string
+}
+
+// ProgressCallback 进度回调；返回 true 可请求取消生成，
+// 底层会在最近的安全点尽快停止，Generate* 返回 ErrGenerationCanceled。
+type ProgressCallback func(p ProgressInfo) (cancel bool)
+
+// ErrGenerationCanceled 表示生成被进度回调取消。
+var ErrGenerationCanceled = errors.New("stablediffusion: generation canceled by progress callback")
 
 // Context 表示stable-diffusion的上下文
 type Context struct {
@@ -90,6 +111,8 @@ type GenerationConfig struct {
 	Sampler            SamplerConfig
 	VaeTilingParams    TilingParams
 	Cache              CacheParams
+	// ProgressCallback 可选的进度回调，返回 true 可取消本次生成。
+	ProgressCallback ProgressCallback
 }
 
 // Upscaler 表示超分辨率器
@@ -146,9 +169,9 @@ type ContextOptions struct {
 // DefaultContextOptions 返回具有默认参数的上下文选项
 func DefaultContextOptions(modelPath string) ContextOptions {
 	return ContextOptions{
-		ModelPath: modelPath,
-		NThreads:  -1, // 自动
-		Wtype:     bindings.SD_TYPE_F16,
+		ModelPath:  modelPath,
+		NThreads:   -1, // 自动
+		Wtype:      bindings.SD_TYPE_F16,
 		EnableMmap: true,
 	}
 }
@@ -300,8 +323,41 @@ func (u *Upscaler) GetUpscaleFactor() int {
 	return bindings.GetUpscaleFactor(u.ctx)
 }
 
+// progressBridge 保存本次生成回调的取消状态
+type progressBridge struct {
+	canceled bool
+}
+
+// installProgressCallback 安装进度回调，返回清理函数。
+func installProgressCallback(cb ProgressCallback) *progressBridge {
+	if cb == nil {
+		return nil
+	}
+	b := &progressBridge{}
+	bindings.SetProgressCallback(func(step, steps int, t float32, phase string, _ unsafe.Pointer) bool {
+		if cb(ProgressInfo{
+			Step:  step,
+			Steps: steps,
+			Time:  t,
+			Phase: phase,
+		}) {
+			b.canceled = true
+			return true
+		}
+		return false
+	}, nil)
+	return b
+}
+
+func clearProgressCallback() {
+	bindings.SetProgressCallback(nil, nil)
+}
+
 // GenerateImage 生成图像
 func (c *Context) GenerateImage(cfg GenerationConfig) ([]*Image, error) {
+	bridge := installProgressCallback(cfg.ProgressCallback)
+	defer clearProgressCallback()
+
 	// 初始化图像生成参数
 	params := &bindings.SdImgGenParams{}
 	bindings.SdImgGenParamsInit(params)
@@ -422,6 +478,9 @@ func (c *Context) GenerateImage(cfg GenerationConfig) ([]*Image, error) {
 	// 生成图像
 	result := bindings.GenerateImage(c.ctx, params)
 	if result == nil {
+		if bridge != nil && bridge.canceled {
+			return nil, ErrGenerationCanceled
+		}
 		return nil, fmt.Errorf("failed to generate image")
 	}
 
@@ -504,26 +563,31 @@ func PreprocessCanny(img *Image, highThreshold, lowThreshold, weak, strong float
 
 // VideoGenerationConfig 表示视频生成配置
 type VideoGenerationConfig struct {
-	Prompt                string
-	NegativePrompt        string
-	Width                 int
-	Height                int
-	Seed                  int64
-	Strength              float32
-	ClipSkip              int
-	Loras                 []Lora
-	ControlFrames         []Image
-	InitImage             *Image
-	EndImage              *Image
-	VideoFrames           int
-	MoeBoundary           float32
-	VaceStrength          float32
-	Sampler               SamplerConfig
-	HighNoiseSampler      SamplerConfig
+	Prompt           string
+	NegativePrompt   string
+	Width            int
+	Height           int
+	Seed             int64
+	Strength         float32
+	ClipSkip         int
+	Loras            []Lora
+	ControlFrames    []Image
+	InitImage        *Image
+	EndImage         *Image
+	VideoFrames      int
+	MoeBoundary      float32
+	VaceStrength     float32
+	Sampler          SamplerConfig
+	HighNoiseSampler SamplerConfig
+	// ProgressCallback 可选的进度回调，返回 true 可取消本次生成。
+	ProgressCallback ProgressCallback
 }
 
 // GenerateVideo 生成视频
 func (c *Context) GenerateVideo(cfg VideoGenerationConfig) ([]*Image, error) {
+	bridge := installProgressCallback(cfg.ProgressCallback)
+	defer clearProgressCallback()
+
 	params := &bindings.SdVidGenParams{}
 	bindings.SdVidGenParamsInit(params)
 
@@ -608,6 +672,9 @@ func (c *Context) GenerateVideo(cfg VideoGenerationConfig) ([]*Image, error) {
 	var numFramesOut int
 	result := bindings.GenerateVideo(c.ctx, params, &numFramesOut)
 	if result == nil || numFramesOut == 0 {
+		if bridge != nil && bridge.canceled {
+			return nil, ErrGenerationCanceled
+		}
 		return nil, fmt.Errorf("failed to generate video")
 	}
 
@@ -639,9 +706,23 @@ func SetLogCallback(cb bindings.SdLogCb, data unsafe.Pointer) {
 	bindings.SetLogCallback(cb, data)
 }
 
-// SetProgressCallback 设置进度回调
-func SetProgressCallback(cb bindings.SdProgressCb, data unsafe.Pointer) {
-	bindings.SetProgressCallback(cb, data)
+// SetProgressCallback 全局设置进度回调（底层 C 接口为进程级单例）。
+// 多数情况下直接使用 GenerationConfig.ProgressCallback 即可；
+// 该全局回调也可用于接收 NewContext 阶段的 "loading model" 进度。
+// 传入 nil 清除回调。
+func SetProgressCallback(cb ProgressCallback) {
+	if cb == nil {
+		bindings.SetProgressCallback(nil, nil)
+		return
+	}
+	bindings.SetProgressCallback(func(step, steps int, t float32, phase string, _ unsafe.Pointer) bool {
+		return cb(ProgressInfo{
+			Step:  step,
+			Steps: steps,
+			Time:  t,
+			Phase: phase,
+		})
+	}, nil)
 }
 
 // SetPreviewCallback 设置预览回调

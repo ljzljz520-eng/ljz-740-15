@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -104,7 +105,7 @@ const (
 	TCD_SAMPLE_METHOD
 	RES_MULTISTEP_SAMPLE_METHOD
 	RES_2S_SAMPLE_METHOD
-	SAMPLE_METHOD = iota // Added to match header logic if needed, but SAMPLE_METHOD_COUNT is usually last
+	SAMPLE_METHOD       = iota // Added to match header logic if needed, but SAMPLE_METHOD_COUNT is usually last
 	SAMPLE_METHOD_COUNT = RES_2S_SAMPLE_METHOD + 1
 
 	// Scheduler
@@ -195,12 +196,12 @@ const (
 
 // 结构体定义
 type SdTilingParams struct {
-	Enabled        bool
-	TileSizeX      int
-	TileSizeY      int
-	TargetOverlap  float32
-	RelSizeX       float32
-	RelSizeY       float32
+	Enabled       bool
+	TileSizeX     int
+	TileSizeY     int
+	TargetOverlap float32
+	RelSizeX      float32
+	RelSizeY      float32
 }
 
 type SdEmbedding struct {
@@ -372,7 +373,13 @@ type UpscalerCtx struct{}
 
 // 回调函数类型
 type SdLogCb func(level SdLogLevel, text *byte, data unsafe.Pointer)
-type SdProgressCb func(step, steps int, time float32, data unsafe.Pointer)
+
+// SdProgressCb 进度回调。
+// step/steps 为当前阶段的进度（step 从 0 到 steps），time 是每步耗时（秒），
+// phase 是当前阶段文字（如 "loading model"、"sampling"、"decoding"）。
+// 返回 true 请求取消生成，底层会尽快停止。
+type SdProgressCb func(step, steps int, time float32, phase string, data unsafe.Pointer) bool
+
 type SdPreviewCb func(step, frameCount int, frames *SdImage, isNoisy bool, data unsafe.Pointer)
 
 // 函数原型定义
@@ -420,8 +427,8 @@ var (
 	freeSdCtx func(ctx *SdCtx)
 
 	// 采样参数初始化
-	sdSampleParamsInit   func(params *SdSampleParams)
-	sdSampleParamsToStr  func(params *SdSampleParams) *byte
+	sdSampleParamsInit  func(params *SdSampleParams)
+	sdSampleParamsToStr func(params *SdSampleParams) *byte
 
 	// 获取默认采样方法和调度器
 	sdGetDefaultSampleMethod func(ctx *SdCtx) SampleMethod
@@ -525,9 +532,10 @@ func setMockImplementations() {
 		return 10
 	}
 
-	// 模拟上下文创建函数
+	// 模拟上下文创建函数：返回非 nil 的占位上下文，
+	// 便于在没有共享库的环境下走通高层 API 流程（生成结果仍为 nil）。
 	newSdCtx = func(params *SdCtxParams) *SdCtx {
-		return nil
+		return &SdCtx{}
 	}
 
 	// 模拟其他函数
@@ -539,9 +547,11 @@ func setMockImplementations() {
 		return KARRAS_SCHEDULER
 	}
 	generateImage = func(ctx *SdCtx, params *SdImgGenParams) *SdImage {
+		mockRunProgress(params.SampleParams.SampleSteps, params.BatchCount)
 		return nil
 	}
 	generateVideo = func(ctx *SdCtx, params *SdVidGenParams, numFramesOut *int) *SdImage {
+		mockRunProgress(params.SampleParams.SampleSteps, 1)
 		return nil
 	}
 	newUpscalerCtx = func(esrganPath *byte, offloadParamsToCpu, direct bool, nThreads, tileSize int) *UpscalerCtx {
@@ -627,6 +637,50 @@ func setMockImplementations() {
 	sdSetPreviewCallback = func(cb uintptr, mode Preview, interval int, denoised, noisy bool, data unsafe.Pointer) {}
 }
 
+// mock 模式下由 SetProgressCallback 注册的 Go 回调
+var mockActiveProgress SdProgressCb
+
+// mockRunProgress 在无动态库时模拟一次生成的进度事件，并尊重取消请求。
+func mockRunProgress(steps, batches int) {
+	if steps <= 0 {
+		steps = 20
+	}
+	if batches <= 0 {
+		batches = 1
+	}
+	invoke := func(step, total int, t float32, phase string) bool {
+		if mockActiveProgress != nil {
+			return mockActiveProgress(step, total, t, phase, nil)
+		}
+		return false
+	}
+	if invoke(0, 0, 0, "loading model") {
+		return
+	}
+	if invoke(0, 0, 0, "encoding prompt") {
+		return
+	}
+	for b := 0; b < batches; b++ {
+		phase := "sampling"
+		if batches > 1 {
+			phase = fmt.Sprintf("sampling %d/%d", b+1, batches)
+		}
+		if invoke(0, steps, 0, phase) {
+			return
+		}
+		for s := 1; s <= steps; s++ {
+			// 模拟真实采样每步的耗时，便于观察取消信号
+			time.Sleep(time.Millisecond)
+			if invoke(s, steps, 0.05, phase) {
+				return
+			}
+		}
+	}
+	if invoke(0, 0, 0, "decoding") {
+		return
+	}
+}
+
 // 辅助函数：将Go字符串转换为C字符串
 func CString(s string) *byte {
 	// 关键修复：添加 NULL 结尾
@@ -663,10 +717,21 @@ func SetLogCallback(cb SdLogCb, data unsafe.Pointer) {
 	sdSetLogCallback(currentLogCallback, data)
 }
 
-// SetProgressCallback 设置进度回调
+// SetProgressCallback 设置进度回调。
+// 传入 nil 可清除回调。回调返回 true 表示请求取消生成。
 func SetProgressCallback(cb SdProgressCb, data unsafe.Pointer) {
-	currentProgressCallback = purego.NewCallback(func(step, steps int, time float32, d unsafe.Pointer) {
-		cb(step, steps, time, d)
+	mockActiveProgress = cb
+	// mock 模式下没有真正的动态库，不需要生成 C 回调跳板
+	if lib == 0 {
+		return
+	}
+	if cb == nil {
+		currentProgressCallback = 0
+		sdSetProgressCallback(0, data)
+		return
+	}
+	currentProgressCallback = purego.NewCallback(func(step, steps int, time float32, phase *byte, d unsafe.Pointer) bool {
+		return cb(step, steps, time, GoString(phase), d)
 	})
 	sdSetProgressCallback(currentProgressCallback, data)
 }

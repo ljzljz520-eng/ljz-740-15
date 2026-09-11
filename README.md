@@ -135,6 +135,37 @@ func main() {
 }
 ```
 
+### 进度回调与取消
+
+生成时可在配置中传入 `ProgressCallback`，回调收到当前阶段文字（`loading model`、
+`encoding prompt`、`sampling`、`sampling (high noise)`、`decoding` 等）以及
+当前步 / 总步数；回调返回 `true` 即请求取消，底层 C++ 会在最近的安全点尽快停止，
+`GenerateImage`/`GenerateVideo` 随后返回 `ErrGenerationCanceled`。
+
+```go
+cfg.ProgressCallback = func(p stablediffusion.ProgressInfo) (cancel bool) {
+    if p.Steps > 0 {
+        log.Printf("%s: %d/%d (%.2fs/it)", p.Phase, p.Step, p.Steps, p.Time)
+    } else {
+        log.Printf("phase: %s", p.Phase)
+    }
+    return false // 返回 true 可随时取消
+}
+
+images, err := ctx.GenerateImage(cfg)
+if errors.Is(err, stablediffusion.ErrGenerationCanceled) {
+    log.Println("已取消")
+}
+```
+
+模型加载发生在 `NewContext` 内部，若也想接收加载进度，可先调用进程级的
+`stablediffusion.SetProgressCallback`。可运行的命令行示例见 `examples/cli`：
+
+```bash
+go run ./examples/cli -mock -steps 30 -progress-every 3      # 打印进度
+go run ./examples/cli -mock -steps 30 -cancel-after 8        # 第 8 步后取消
+```
+
 ### 完整 API 清单
 
 对比 `stable-diffusion.h` 全部 38 个导出函数，以下是绑定覆盖状态：
@@ -195,6 +226,7 @@ func main() {
 ├── test/
 │   └── stablediffusion_test.go   # 高层 API 集成测试
 ├── examples/
+│   ├── cli/main.go                # 进度回调/取消命令行示例
 │   └── server/server.go          # 生产级 HTTP 服务示例
 ├── stable-diffusion.cpp/         # 核心 C++ 库（子模块）
 ├── Dockerfile                    # 多阶段 Linux Docker 构建
